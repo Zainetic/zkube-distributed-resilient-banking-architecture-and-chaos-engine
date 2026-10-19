@@ -24,6 +24,10 @@ public class AccountsApiTest {
         app.post("/api/accounts", ctx -> {
             ctx.status(200).json("{\"id\": \"uuid-1234\", \"ownerName\": \"Alice\", \"balance\": 1000.00}");
         });
+
+        app.get("/api/accounts/health", ctx -> {
+            ctx.json("{\"status\": \"UP\", \"service\": \"accounts\"}");
+        });
     }
 
     @AfterAll
@@ -48,5 +52,16 @@ public class AccountsApiTest {
             .body("ownerName", equalTo("Alice"))
             .body("balance", equalTo(1000.0f))
             .body("id", notNullValue());
+    }
+
+    @Test
+    void shouldReturnUpStatusOnHealthCheck() {
+        given()
+        .when()
+            .get("/api/accounts/health")
+        .then()
+            .statusCode(200)
+            .body("status", equalTo("UP"))
+            .body("service", equalTo("accounts"));
     }
 }
