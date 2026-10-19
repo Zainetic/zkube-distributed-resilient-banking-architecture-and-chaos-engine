@@ -6,16 +6,18 @@ import org.jooq.DSLContext;
 import org.jooq.SQLDialect;
 import org.jooq.impl.DSL;
 
-import java.sql.Connection;
-
 public class Database {
     private static HikariDataSource dataSource;
 
     public static void init() {
         HikariConfig config = new HikariConfig();
-        config.setJdbcUrl("jdbc:postgresql://postgres-db:5432/zkube_chaos");
-        	config.setUsername("postgres");
-        config.setPassword("admin");
+        String jdbcUrl = System.getenv().getOrDefault("DB_URL", "jdbc:postgresql://postgres-db:5432/zkube_chaos");
+        String username = System.getenv().getOrDefault("DB_USER", "postgres");
+        String password = System.getenv().getOrDefault("DB_PASSWORD", "admin");
+
+        config.setJdbcUrl(jdbcUrl);
+        config.setUsername(username);
+        config.setPassword(password);
         
         // Connection pool settings optimized for microservices
         config.setMaximumPoolSize(10);
@@ -27,10 +29,13 @@ public class Database {
 
     public static DSLContext getContext() {
         try {
-            Connection connection = dataSource.getConnection();
-            return DSL.using(connection, SQLDialect.POSTGRES);
+            return DSL.using(dataSource, SQLDialect.POSTGRES);
         } catch (Exception e) {
-            throw new RuntimeException("Failed to get database connection", e);
+            throw new RuntimeException("Failed to get database context", e);
         }
+    }
+
+    public static HikariDataSource getDataSource() {
+        return dataSource;
     }
 }

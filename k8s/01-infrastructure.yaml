@@ -20,6 +20,10 @@ data:
         status VARCHAR(20) NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE INDEX IF NOT EXISTS idx_transfers_source ON transfers(from_account);
+    CREATE INDEX IF NOT EXISTS idx_transfers_target ON transfers(to_account);
+    CREATE INDEX IF NOT EXISTS idx_transfers_status ON transfers(status);
 ---
 # ---------------------------------------------------------
 # REDIS DEPLOYMENT & SERVICE

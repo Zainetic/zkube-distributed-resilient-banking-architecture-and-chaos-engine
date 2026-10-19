@@ -12,8 +12,9 @@ import static org.jooq.impl.DSL.*;
 
 public class TransactionsApplication {
 
-    // Connect to Docker Redis instance
-	private static final JedisPool jedisPool = new JedisPool("redis-cache", 6379);
+    private static final String REDIS_HOST = System.getenv().getOrDefault("REDIS_HOST", "redis-cache");
+    private static final int REDIS_PORT = Integer.parseInt(System.getenv().getOrDefault("REDIS_PORT", "6379"));
+    private static final JedisPool jedisPool = new JedisPool(REDIS_HOST, REDIS_PORT);
 
     public static void main(String[] args) {
         
@@ -34,7 +35,7 @@ public class TransactionsApplication {
 
             try {
                 // START ACID TRANSACTION
-                dsl.transaction(configuration -> {
+                UUID transferId = dsl.transactionResult(configuration -> {
                     DSLContext tx = using(configuration);
 
                     // 1. Lock BOTH rows simultaneously to prevent race conditions
@@ -66,19 +67,19 @@ public class TransactionsApplication {
                       .execute();
 
                     // 5. Record the Transfer
-                    UUID transferId = tx.insertInto(table("transfers"), field("from_account"), field("to_account"), field("amount"), field("status"))
-                                        .values(fromAccount, toAccount, amount, "COMPLETED")
-                                        .returningResult(field("id", UUID.class))
-                                        .fetchOneInto(UUID.class);
-
-                    // 6. Push to Redis Notification Queue
-                    try (var jedis = jedisPool.getResource()) {
-                        jedis.lpush("notification_queue", "Transfer " + transferId + " completed for $" + amount);
-                    }
-                    
-                    ctx.status(200).json("{\"status\": \"SUCCESS\", \"transferId\": \"" + transferId + "\"}");
+                    return tx.insertInto(table("transfers"), field("from_account"), field("to_account"), field("amount"), field("status"))
+                             .values(fromAccount, toAccount, amount, "COMPLETED")
+                             .returningResult(field("id", UUID.class))
+                             .fetchOneInto(UUID.class);
                 });
-                // END ACID TRANSACTION 
+                // END ACID TRANSACTION - COMMIT CONFIRMED
+
+                // 6. Push to Redis Notification Queue after successful commit
+                try (var jedis = jedisPool.getResource()) {
+                    jedis.lpush("notification_queue", "Transfer " + transferId + " completed for $" + amount);
+                }
+                
+                ctx.status(200).json("{\"status\": \"SUCCESS\", \"transferId\": \"" + transferId + "\"}");
 
             } catch (Exception e) {
                 ctx.status(400).json("{\"status\": \"FAILED\", \"error\": \"" + e.getMessage() + "\"}");

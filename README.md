@@ -10,10 +10,10 @@ This architecture demonstrates that even during infrastructure failures (such as
 
 The cluster is divided into independent, scalable domains:
 
-- **Synchronous Accounts Service (REST):** Manages user creation and balance states, persisting directly to PostgreSQL via HikariCP connection pooling.
+- **Synchronous Accounts Service (REST):** Manages user creation and balance states, persisting directly to PostgreSQL via HikariCP connection pooling and jOOQ.
 - **Decoupled Transactions Service (REST -> Redis):** Executes atomic database locks for transferring funds between accounts. Upon successful commit, it publishes a notification payload to a Redis queue rather than waiting for a synchronous notification response.
 - **Asynchronous Notifications Worker:** A background consumer that listens to the Redis `notification_queue`. It processes the queue sequentially, ensuring delivery even if the worker pod is killed and restarted.
-- **Automated Infrastructure State:** PostgreSQL is bootstrapped automatically via Kubernetes ConfigMaps, ensuring the database schema is injected and ready before the Java applications boot.
+- **Automated Infrastructure State:** PostgreSQL is bootstrapped automatically via Kubernetes ConfigMaps, ensuring the database schema and indexes are injected and ready before the Java applications boot.
 
 ### Architecture Diagram
 
@@ -61,10 +61,11 @@ graph TD
 
 ## Key Technical Features
 
-- **Kubernetes Orchestration:** Implements declarative Deployments, LoadBalancers, and ClusterIP routing to ensure pods are constantly monitored and traffic is load-balanced. Strict `livenessProbe` checks ensure deadlocked or unhealthy applications are automatically terminated and restarted.
-- **Event-Driven Self-Healing:** The notification worker is decoupled from the transaction execution path. If the notification pod fails, the transaction service continues committing transfers and queuing messages in Redis (`notification_queue`) until a replacement pod starts and drains the backlog.
-- **Automated Data Provisioning:** Utilizes Kubernetes ConfigMaps and Volume mounts (`/docker-entrypoint-initdb.d/init.sql`) to automate database table creation (`accounts` and `transfers`) upon cluster initialization.
+- **Kubernetes Orchestration & Traffic Gating:** Implements declarative Deployments, LoadBalancers, and ClusterIP routing. Strict `livenessProbe` and `readinessProbe` checks ensure traffic is routed only after JVM startup, and unhealthy containers are automatically terminated and restarted. Container resource bounds (`requests` and `limits`) protect cluster memory and CPU capacity.
+- **Event-Driven Self-Healing:** The notification worker is decoupled from the transaction execution path with an automatic reconnection loop. If Redis drops or the worker pod restarts, the transaction service continues committing transfers and queuing messages in Redis (`notification_queue`) until the worker drains the backlog.
+- **Automated Data Provisioning & Indexing:** Utilizes Kubernetes ConfigMaps and Volume mounts (`/docker-entrypoint-initdb.d/init.sql`) to automate table creation (`accounts` and `transfers`) and foreign key indexing (`idx_transfers_source`, `idx_transfers_target`, `idx_transfers_status`) upon cluster initialization.
 - **Chaos Engineering Ready:** Fully integrated with Chaos Mesh to programmatically inject pod-kill and network faults into the live cluster, verifying zero-downtime resilience and recovery under active transactional load.
+- **12-Factor Configuration:** Microservices externalize database and cache connections through environment variables, supporting seamless operation across local JVM, Docker Compose, and Kubernetes environments.
 
 ## Technology Stack
 
@@ -73,9 +74,22 @@ graph TD
 - **Data Access & Pooling:** jOOQ, HikariCP
 - **In-Memory Datastore / Queuing:** Redis 7.2 (Alpine)
 - **Relational Database:** PostgreSQL 16 (Alpine)
-- **Orchestration & DevOps:** Docker, Kubernetes (Local cluster e.g., Docker Desktop / Kubeadm)
+- **Build & DevOps:** Maven Wrapper (`mvnw` / `mvnw.cmd`), Docker, Docker Compose, Kubernetes (Docker Desktop / Kubeadm)
 - **Chaos Engineering:** Helm, Chaos Mesh
+- **Benchmark Suite:** Python 3 standard library benchmark runner ([chaos/run-test.py](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/chaos/run-test.py))
 - **Testing:** JUnit 5, REST-assured, Testcontainers
+
+## Configuration & Environment Variables
+
+All microservices support dynamic runtime configuration through environment variables with sensible defaults for local development:
+
+| Variable | Default Value | Description |
+|:---|:---|:---|
+| `DB_URL` | `jdbc:postgresql://postgres-db:5432/zkube_chaos` | JDBC connection URL for PostgreSQL |
+| `DB_USER` | `postgres` | Database user |
+| `DB_PASSWORD` | `admin` | Database password |
+| `REDIS_HOST` | `redis-cache` | Hostname or service name for Redis |
+| `REDIS_PORT` | `6379` | Port for Redis service |
 
 ## CI & Tests
 
@@ -100,9 +114,19 @@ Continuous Integration is managed via GitHub Actions in [.github/workflows/ci.ym
 
 This guide walks through deploying the system from scratch to a local Docker Desktop or Kubeadm Kubernetes cluster.
 
-### 1. Build the Docker Images
+### 1. Build Application JARs and Docker Images
 
-Navigate to each microservice directory and package the Java applications into Docker images. (Ensure you have run `mvn clean package` first to generate the FAT JARs).
+First, package all microservice applications into FAT JARs using the included Maven Wrapper:
+
+```bash
+# On Linux / macOS:
+./mvnw clean package
+
+# On Windows:
+.\mvnw.cmd clean package
+```
+
+Next, build the container images:
 
 **Build Accounts Service:**
 
@@ -131,7 +155,26 @@ docker build -t zkube-notifications:latest .
 cd ..
 ```
 
-### 2. Deploy Infrastructure & Databases
+---
+
+### Alternative: Run with Docker Compose
+
+For rapid local testing outside Kubernetes, the entire stack can be launched via Docker Compose:
+
+```bash
+docker compose up -d
+```
+
+To view logs or stop the environment:
+
+```bash
+docker compose logs -f
+docker compose down
+```
+
+---
+
+### 2. Deploy Infrastructure & Databases (Kubernetes)
 
 Deploy the persistence layer first. This applies the ConfigMap containing the SQL initialization scripts, spins up Redis, and boots PostgreSQL:
 
@@ -240,15 +283,22 @@ kubectl create token chaos-admin -n chaos-mesh --duration=48h
 3. Paste the token to authenticate.
 4. Create an experiment under **Pod Fault** -> **Pod Kill** targeting `app: transactions` with a continuous or recurring schedule.
 
-### 4. Observe Resilience and Self-Healing
+### 4. Observe Resilience with the Automated Benchmark Suite
 
-While the chaos experiment is active, stream logs from the decoupled notification worker:
+To measure system performance under chaos, run the automated benchmark runner [chaos/run-test.py](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/chaos/run-test.py):
 
 ```bash
-kubectl logs deployment/notifications-deployment -f
+python chaos/run-test.py --duration 60 --requests 300 --concurrency 5
 ```
 
-Generate concurrent traffic against the Transactions API (e.g., using Postman Runner, curl, or k6). As pods are terminated by Chaos Mesh, Kubernetes automatically redirects traffic to healthy pods and spins up replacements. Transactions complete successfully (`200 OK`), and the Redis queue safely preserves all notifications until a worker pod processes the backlog.
+While the chaos experiment is active:
+- The script automatically provisions test accounts, dispatches concurrent transfer requests, and measures latency.
+- Simultaneously stream logs from the notification worker to watch asynchronous processing:
+  ```bash
+  kubectl logs deployment/notifications-deployment -f
+  ```
+- As pods are terminated by Chaos Mesh, Kubernetes automatically redirects traffic to healthy pods and spins up replacements. Transactions complete successfully (`200 OK`), and the Redis queue safely preserves all notifications until a worker pod processes the backlog.
+- Detailed instructions for measuring pod recovery times and interpreting results are documented in [chaos/README.md](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/chaos/README.md).
 
 ## API Documentation
 
@@ -295,4 +345,5 @@ Used internally by Kubernetes `livenessProbe` and `readinessProbe` to verify pod
 
 ## Results
 
+<!-- Run python chaos/run-test.py while a chaos experiment is active, then paste the generated benchmark Markdown table here. -->
 TODO

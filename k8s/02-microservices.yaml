@@ -31,6 +31,13 @@ spec:
             path: /api/accounts/health
             port: 8081
           initialDelaySeconds: 5
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
 ---
 apiVersion: v1
 kind: Service
@@ -73,6 +80,18 @@ spec:
             path: /api/transactions/health 
             port: 8082
           initialDelaySeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /api/transactions/health
+            port: 8082
+          initialDelaySeconds: 5
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
 ---
 apiVersion: v1
 kind: Service
@@ -115,6 +134,18 @@ spec:
             path: /api/notifications/health
             port: 8083
           initialDelaySeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /api/notifications/health
+            port: 8083
+          initialDelaySeconds: 5
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
 ---
 apiVersion: v1
 kind: Service
