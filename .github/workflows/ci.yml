@@ -9,6 +9,9 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    env:
+      DOCKER_API_VERSION: "1.44"
+      TESTCONTAINERS_RYUK_DISABLED: "false"
 
     steps:
     - name: Checkout Code
