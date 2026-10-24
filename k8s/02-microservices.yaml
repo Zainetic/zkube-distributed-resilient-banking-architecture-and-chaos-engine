@@ -6,7 +6,12 @@ kind: Deployment
 metadata:
   name: accounts-deployment
 spec:
-  replicas: 1
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: accounts
@@ -21,16 +26,35 @@ spec:
         imagePullPolicy: Never 
         ports:
         - containerPort: 8081
+        env:
+        - name: DB_URL
+          valueFrom:
+            secretKeyRef:
+              name: zkube-secrets
+              key: DB_URL
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: zkube-secrets
+              key: POSTGRES_USER
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: zkube-secrets
+              key: POSTGRES_PASSWORD
         livenessProbe:
           httpGet:
             path: /api/accounts/health
             port: 8081
-          initialDelaySeconds: 5
+          initialDelaySeconds: 3
+          periodSeconds: 5
         readinessProbe:
           httpGet:
             path: /api/accounts/health
             port: 8081
-          initialDelaySeconds: 5
+          initialDelaySeconds: 2
+          periodSeconds: 2
+          failureThreshold: 1
         resources:
           requests:
             memory: "256Mi"
@@ -60,7 +84,12 @@ kind: Deployment
 metadata:
   name: transactions-deployment
 spec:
-  replicas: 1
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: transactions
@@ -75,16 +104,39 @@ spec:
         imagePullPolicy: Never
         ports:
         - containerPort: 8082
+        env:
+        - name: DB_URL
+          valueFrom:
+            secretKeyRef:
+              name: zkube-secrets
+              key: DB_URL
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: zkube-secrets
+              key: POSTGRES_USER
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: zkube-secrets
+              key: POSTGRES_PASSWORD
+        - name: REDIS_HOST
+          value: "redis-cache"
+        - name: REDIS_PORT
+          value: "6379"
         livenessProbe:
           httpGet:
             path: /api/transactions/health 
             port: 8082
-          initialDelaySeconds: 5
+          initialDelaySeconds: 3
+          periodSeconds: 5
         readinessProbe:
           httpGet:
             path: /api/transactions/health
             port: 8082
-          initialDelaySeconds: 5
+          initialDelaySeconds: 2
+          periodSeconds: 2
+          failureThreshold: 1
         resources:
           requests:
             memory: "256Mi"
@@ -114,7 +166,12 @@ kind: Deployment
 metadata:
   name: notifications-deployment
 spec:
-  replicas: 1
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: notifications
@@ -129,16 +186,24 @@ spec:
         imagePullPolicy: Never
         ports:
         - containerPort: 8083
+        env:
+        - name: REDIS_HOST
+          value: "redis-cache"
+        - name: REDIS_PORT
+          value: "6379"
         livenessProbe:
           httpGet:
             path: /api/notifications/health
             port: 8083
-          initialDelaySeconds: 5
+          initialDelaySeconds: 3
+          periodSeconds: 5
         readinessProbe:
           httpGet:
             path: /api/notifications/health
             port: 8083
-          initialDelaySeconds: 5
+          initialDelaySeconds: 2
+          periodSeconds: 2
+          failureThreshold: 1
         resources:
           requests:
             memory: "256Mi"
