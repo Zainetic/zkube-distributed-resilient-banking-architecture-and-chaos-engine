@@ -12,3 +12,6 @@ notifications-service/.classpath
 Imp Commands.txt
 __pycache__/
 *.pyc
+accounts-service/.settings/org.eclipse.jdt.apt.core.prefs
+notifications-service/.settings/org.eclipse.jdt.apt.core.prefs
+transactions-service/.settings/org.eclipse.jdt.apt.core.prefs
