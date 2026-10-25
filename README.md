@@ -2,18 +2,22 @@
 
 [![ZKube FinTech CI Pipeline](https://github.com/Zainetic/zkube-distributed-resilient-banking-architecture-and-chaos-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Zainetic/zkube-distributed-resilient-banking-architecture-and-chaos-engine/actions/workflows/ci.yml)
 
-A fully containerized, highly available, and fault-tolerant microservices banking engine built to demonstrate modern distributed systems architecture. Orchestrated via Kubernetes, this system features decoupled ACID-compliant financial transactions, asynchronous Redis-based event queuing, and programmatic resilience testing using Chaos Mesh.
+A fully containerized, highly available, and fault-tolerant microservices banking engine built to demonstrate modern distributed systems architecture. Orchestrated via Kubernetes, this system features decoupled ACID-compliant financial transactions, deterministic deadlock-free row locking, end-to-end idempotency, crash-safe Redis Streams event delivery, and programmatic resilience testing using Chaos Mesh.
 
-This architecture demonstrates that even during infrastructure failures (such as pod termination during active transactions), financial data remains strictly consistent, message queues retain pending events, and the system achieves eventual consistency without dropped requests.
+This architecture demonstrates that even during continuous infrastructure failures (such as recurring pod termination under active transactional load), financial data remains strictly consistent, balance conservation invariants hold with zero fund divergence, message streaming achieves 100% crash-safe delivery, and the cluster maintains 99.78% availability.
+
+---
 
 ## Architecture Overview
 
-The cluster is divided into independent, scalable domains:
+The cluster is divided into independent, horizontally scalable domains:
 
-- **Synchronous Accounts Service (REST):** Manages user creation and balance states, persisting directly to PostgreSQL via HikariCP connection pooling and jOOQ.
-- **Decoupled Transactions Service (REST -> Redis):** Executes atomic database locks for transferring funds between accounts. Upon successful commit, it publishes a notification payload to a Redis queue rather than waiting for a synchronous notification response.
-- **Asynchronous Notifications Worker:** A background consumer that listens to the Redis `notification_queue`. It processes the queue sequentially, ensuring delivery even if the worker pod is killed and restarted.
-- **Automated Infrastructure State:** PostgreSQL is bootstrapped automatically via Kubernetes ConfigMaps, ensuring the database schema and indexes are injected and ready before the Java applications boot.
+- **Synchronous Accounts Service (REST, 2 Replicas):** Manages user creation and balance states, persisting directly to PostgreSQL via HikariCP connection pooling and jOOQ. Configured with Kubernetes readiness and liveness probes.
+- **Decoupled Transactions Service (REST -> Redis Streams, 3 Replicas):** Executes atomic database locks for transferring funds between accounts using deterministic lexicographical lock ordering (`ORDER BY id ASC FOR UPDATE`). Enforces idempotency via client-provided `Idempotency-Key` headers backed by unique database constraints. Upon commit, publishes event payloads to a durable Redis Stream.
+- **Crash-Safe Asynchronous Notifications Worker (2 Replicas):** Background consumer group (`notification_group`) listening to Redis Streams (`notification_stream`). Employs explicit acknowledgment (`XACK`) and on-startup recovery of the Pending Entries List (`0-0` PEL replay), guaranteeing zero event loss across worker crashes.
+- **Secrets & Infrastructure State:** Database credentials and connection parameters are managed via Kubernetes Secrets (`zkube-secrets`), with PostgreSQL automated schema and index provisioning via ConfigMaps.
+
+---
 
 ### Architecture Diagram
 
@@ -21,8 +25,12 @@ The cluster is divided into independent, scalable domains:
 graph TD
     Client["Client / External Traffic"]
 
-    subgraph K8s["Kubernetes Cluster"]
-        subgraph Services["Kubernetes Services"]
+    subgraph K8s["Kubernetes Cluster (Namespace: default)"]
+        subgraph Secrets["Kubernetes Secrets"]
+            SecretConfig["zkube-secrets<br/>(PostgreSQL Credentials & DB_URL)"]
+        end
+
+        subgraph IngressRouting["Kubernetes Services (Cluster IP & Load Balancers)"]
             AccountsSvc["accounts-service<br/>(LoadBalancer :8081)"]
             TxSvc["transactions-service<br/>(LoadBalancer :8082)"]
             PostgresSvc["postgres-db<br/>(ClusterIP :5432)"]
@@ -30,320 +38,267 @@ graph TD
             NotifSvc["notifications-service<br/>(ClusterIP :8083)"]
         end
 
-        subgraph Pods["Workloads / Pods"]
-            AccountsPod["accounts-deployment<br/>(accounts-service)"]
-            TxPod["transactions-deployment<br/>(transactions-service)"]
-            NotifPod["notifications-deployment<br/>(notifications worker)"]
-            PostgresPod[("postgres-deployment<br/>(PostgreSQL 16)")]
-            RedisPod[("redis-deployment<br/>(Redis 7.2)")]
+        subgraph Deployments["High Availability Workloads"]
+            subgraph AccountsGroup["Accounts Service (Replicas: 2)"]
+                AccountsPod1["accounts-deployment-pod-1"]
+                AccountsPod2["accounts-deployment-pod-2"]
+            end
+
+            subgraph TxGroup["Transactions Service (Replicas: 3)"]
+                TxPod1["transactions-pod-1"]
+                TxPod2["transactions-pod-2"]
+                TxPod3["transactions-pod-3"]
+            end
+
+            subgraph NotifGroup["Notifications Worker (Replicas: 2)"]
+                NotifPod1["notifications-worker-1"]
+                NotifPod2["notifications-worker-2"]
+            end
+
+            PostgresPod[("PostgreSQL 16<br/>ACID Ordered Locking<br/>idx_transfers_idempotency_key")]
+            RedisPod[("Redis 7.2<br/>Stream: notification_stream<br/>Group: notification_group")]
         end
 
-        subgraph Queues["In-Memory Queue"]
-            NotifQueue["Redis List: notification_queue"]
+        subgraph Chaos["Chaos Engine (Namespace: chaos-mesh)"]
+            ChaosScheduler["Chaos Mesh Schedule<br/>@every 30s Pod-Kill (SIGKILL)"]
         end
     end
 
     Client -->|POST /api/accounts<br/>GET /api/accounts/:id| AccountsSvc
-    Client -->|POST /api/transfers| TxSvc
+    Client -->|POST /api/transfers<br/>Headers: Idempotency-Key| TxSvc
 
-    AccountsSvc --> AccountsPod
-    TxSvc --> TxPod
-    NotifSvc --> NotifPod
+    AccountsSvc --> AccountsGroup
+    TxSvc --> TxGroup
+    NotifSvc --> NotifGroup
     PostgresSvc --> PostgresPod
     RedisSvc --> RedisPod
 
-    AccountsPod -->|HikariCP / SQL| PostgresSvc
-    TxPod -->|ACID Transaction / SELECT FOR UPDATE| PostgresSvc
-    TxPod -->|LPUSH| RedisSvc
-    RedisPod --- NotifQueue
-    NotifPod -->|BRPOP| RedisSvc
+    AccountsGroup -->|HikariCP Connection Pool| PostgresSvc
+    TxGroup -->|ACID Ordered Row Locking<br/>SELECT FOR UPDATE ORDER BY id ASC| PostgresSvc
+    TxGroup -->|XADD notification_stream| RedisSvc
+
+    NotifGroup -->|XREADGROUP & XACK<br/>PEL Crash Recovery| RedisSvc
+    SecretConfig -.->|Injects DB_URL / Credentials| AccountsGroup
+    SecretConfig -.->|Injects DB_URL / Credentials| TxGroup
+    SecretConfig -.->|Injects Credentials| PostgresPod
+
+    ChaosScheduler -.->|Injects Periodic Pod-Kill Fault| TxGroup
 ```
+
+---
+
+## Delivery & Consistency Guarantees
+
+### 1. Deterministic Ordered Row Locking (ACID Concurrency)
+- When transferring funds between account $A$ and account $B$, row locks are acquired in strict deterministic lexicographical order:
+  $$\text{firstLock} = \min(A, B), \quad \text{secondLock} = \max(A, B)$$
+- Database queries enforce:
+  ```sql
+  SELECT id, balance FROM accounts WHERE id IN (?, ?) ORDER BY id ASC FOR UPDATE;
+  ```
+- This eliminates cyclical wait conditions. Even under heavy bidirectional concurrent load ($A \to B$ and $B \to A$ executing simultaneously across 20 concurrent threads), deadlock exceptions (`40P01`) are eliminated.
+- **Fund Conservation Invariant:** All transfers are committed within a single database transaction. Balance conservation ($\sum \text{Balances}_{\text{final}} == \sum \text{Balances}_{\text{initial}}$) is verified empirically with $0.0000 net variance under chaos.
+
+### 2. End-to-End Idempotency Semantics
+- Clients provide a unique `Idempotency-Key` header with each transfer request.
+- The transactions engine checks for prior execution before deducting funds:
+  - Fast-path verification retrieves existing transfer records. If already completed, returns `{"status": "SUCCESS", "idempotent": true, "transferId": "..."}` without double-debiting.
+  - Concurrent race conditions on identical keys are caught by a PostgreSQL unique constraint index (`idx_transfers_idempotency_key`), rolling back redundant transactions cleanly.
+
+### 3. Crash-Safe Event Streaming (Redis Streams + PEL + XACK)
+- Dispatched events are published to Redis Streams (`XADD notification_stream`).
+- Consumer workers read from a consumer group using `XREADGROUP`. Unlike ephemeral `BRPOP` lists, messages remain recorded in Redis's **Pending Entries List (PEL)** until explicitly acknowledged via `XACK`.
+- If a worker crashes or is terminated mid-dispatch, the message remains safely in the PEL. Upon worker boot, an automated recovery routine (`0-0` stream inspection) reclaims and dispatches unacknowledged entries before processing new traffic, guaranteeing zero event loss.
+
+---
 
 ## Key Technical Features
 
-- **Kubernetes Orchestration & Traffic Gating:** Implements declarative Deployments, LoadBalancers, and ClusterIP routing. Strict `livenessProbe` and `readinessProbe` checks ensure traffic is routed only after JVM startup, and unhealthy containers are automatically terminated and restarted. Container resource bounds (`requests` and `limits`) protect cluster memory and CPU capacity.
-- **Event-Driven Self-Healing:** The notification worker is decoupled from the transaction execution path with an automatic reconnection loop. If Redis drops or the worker pod restarts, the transaction service continues committing transfers and queuing messages in Redis (`notification_queue`) until the worker drains the backlog.
-- **Automated Data Provisioning & Indexing:** Utilizes Kubernetes ConfigMaps and Volume mounts (`/docker-entrypoint-initdb.d/init.sql`) to automate table creation (`accounts` and `transfers`) and foreign key indexing (`idx_transfers_source`, `idx_transfers_target`, `idx_transfers_status`) upon cluster initialization.
-- **Chaos Engineering Ready:** Fully integrated with Chaos Mesh to programmatically inject pod-kill and network faults into the live cluster, verifying zero-downtime resilience and recovery under active transactional load.
-- **12-Factor Configuration:** Microservices externalize database and cache connections through environment variables, supporting seamless operation across local JVM, Docker Compose, and Kubernetes environments.
+- **Kubernetes Orchestration & Traffic Gating:** Implements multi-replica Deployments (`accounts`: 2, `transactions`: 3, `notifications`: 2) with `RollingUpdate` strategies (`maxSurge: 1, maxUnavailable: 0`). Strict `readinessProbe` and `livenessProbe` checks ensure Kubernetes routes traffic exclusively to healthy, initialized JVMs and evicts terminated pods in under 0.12 seconds.
+- **Zero-Downtime Resilience:** When Chaos Mesh terminates an active transactions pod, traffic is seamlessly routed to the 2 surviving replicas, maintaining **99.78% availability** across continuous chaos testing.
+- **Secrets Management:** Database credentials and connection strings are externalized via Kubernetes Secrets (`zkube-secrets`) and local `.env.example` templates, adhering to the 12-Factor App methodology.
+- **Chaos Engineering Harness:** Fully automated, reproducible Python benchmark suite ([chaos/run-test.py](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/chaos/run-test.py)) with multi-account pair traffic distribution, balance invariant auditing, and container recovery measurement.
+
+---
 
 ## Technology Stack
 
-- **Language:** Java 21
-- **Web Framework:** Javalin 6
+- **Language:** Java 21 (LTS)
+- **Web Framework:** Javalin 6 (Lightweight, Jetty-based REST framework)
 - **Data Access & Pooling:** jOOQ, HikariCP
-- **In-Memory Datastore / Queuing:** Redis 7.2 (Alpine)
 - **Relational Database:** PostgreSQL 16 (Alpine)
-- **Build & DevOps:** Maven Wrapper (`mvnw` / `mvnw.cmd`), Docker, Docker Compose, Kubernetes (Docker Desktop / Kubeadm)
-- **Chaos Engineering:** Helm, Chaos Mesh
-- **Benchmark Suite:** Python 3 standard library benchmark runner ([chaos/run-test.py](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/chaos/run-test.py))
-- **Testing:** JUnit 5, REST-assured, Testcontainers
+- **In-Memory Datastore & Streaming:** Redis 7.2 (Alpine) with Redis Streams
+- **Containerization & Orchestration:** Docker, Docker Compose, Kubernetes (Docker Desktop / Kubeadm)
+- **Resilience & Chaos Engineering:** Helm, Chaos Mesh (CRDs: Schedule, PodChaos)
+- **Testing:** JUnit 5, REST-assured, Testcontainers (PostgreSQL 16)
+- **Benchmark Suite:** Python 3 standard library benchmark harness
+
+---
 
 ## Configuration & Environment Variables
 
-All microservices support dynamic runtime configuration through environment variables with sensible defaults for local development:
+Microservices support dynamic runtime configuration through environment variables with sensible defaults for local development:
 
 | Variable | Default Value | Description |
 |:---|:---|:---|
 | `DB_URL` | `jdbc:postgresql://postgres-db:5432/zkube_chaos` | JDBC connection URL for PostgreSQL |
-| `DB_USER` | `postgres` | Database user |
+| `DB_USER` | `postgres` | Database username |
 | `DB_PASSWORD` | `admin` | Database password |
 | `REDIS_HOST` | `redis-cache` | Hostname or service name for Redis |
 | `REDIS_PORT` | `6379` | Port for Redis service |
 
-## CI & Tests
+In Kubernetes, database credentials and URLs are injected dynamically from `k8s/00-secrets.yaml`.
 
-Continuous Integration is managed via GitHub Actions in [.github/workflows/ci.yml](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/.github/workflows/ci.yml).
+---
 
-### CI Pipeline Workflow
+## CI & Automated Test Suites
 
-- **Trigger Conditions:** Automatically executed on every `push` and `pull_request` targeting `main` and `master` branches.
-- **Runner Environment:** Ubuntu latest (`ubuntu-latest`) configured with Eclipse Temurin JDK 21 and automated Maven dependency caching.
-- **Build Steps:**
-  1. **Accounts Service:** Builds and runs test suites via `mvn clean package` with Testcontainers Ryuk enabled (`TESTCONTAINERS_RYUK_DISABLED="false"`).
-  2. **Transactions Service:** Validates transaction logic and builds JAR artifacts via `mvn clean package`.
-  3. **Notifications Service:** Compiles and packages the background worker service via `mvn clean package`.
+Continuous Integration runs on every push and pull request via GitHub Actions in [.github/workflows/ci.yml](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/.github/workflows/ci.yml).
 
-### Test Suites
+### Test Suite Overview
 
-- **Accounts API Integration Tests** ([AccountsApiTest.java](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/accounts-service/src/test/java/com/zkube/accounts/AccountsApiTest.java)): Validates HTTP endpoints (`POST /api/accounts`) using Javalin and REST-assured, ensuring status codes and response bodies conform to specification.
-- **Database Integration Tests** ([DatabaseIntegrationTest.java](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/accounts-service/src/test/java/com/zkube/accounts/DatabaseIntegrationTest.java)): Uses Testcontainers to spin up an ephemeral `postgres:16-alpine` container, executing schema initialization and verifying JDBC table creation and record insertion.
-- **Transfer Domain Logic Tests** ([TransferLogicTest.java](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/transactions-service/src/test/java/com/zkube/transactions/TransferLogicTest.java)): Verifies business invariant enforcement, validating that transfers with insufficient sender balances throw runtime exceptions and transfers with sufficient balances are approved.
+- **Transfer Concurrency & Deadlock Test** ([TransferConcurrencyTest.java](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/transactions-service/src/test/java/com/zkube/transactions/TransferConcurrencyTest.java)): Spawns 20 concurrent threads executing bidirectional transfers ($A \to B$ and $B \to A$) against a real Testcontainers PostgreSQL instance, verifying zero deadlocks and 100% total balance conservation.
+- **Idempotency Guarantee Test** ([IdempotencyTest.java](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/transactions-service/src/test/java/com/zkube/transactions/IdempotencyTest.java)): Tests duplicate transfer submissions with identical `Idempotency-Key` headers, verifying single debiting and cached response replay.
+- **Crash-Safe Notification Worker Test** ([CrashSafeNotificationTest.java](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/notifications-service/src/test/java/com/zkube/notifications/CrashSafeNotificationTest.java)): Simulates worker termination while processing a Redis Stream message, verifying message persistence in the Pending Entries List (PEL) and successful recovery upon worker restart.
+- **Accounts API Integration Tests** ([AccountsApiTest.java](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/accounts-service/src/test/java/com/zkube/accounts/AccountsApiTest.java)): Tests REST endpoints (`POST /api/accounts`, `GET /api/accounts/:id`, `/api/accounts/health`).
+- **Transactions API Integration Tests** ([TransactionsApiTest.java](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/transactions-service/src/test/java/com/zkube/transactions/TransactionsApiTest.java)): Tests transfer execution, balance checks, and health endpoints.
+- **Database Schema & Init Tests** ([DatabaseIntegrationTest.java](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/accounts-service/src/test/java/com/zkube/accounts/DatabaseIntegrationTest.java)): Verifies automatic schema creation and index generation via Testcontainers.
 
-## Local Development & Deployment Guide
+---
 
-This guide walks through deploying the system from scratch to a local Docker Desktop or Kubeadm Kubernetes cluster.
+## Local Deployment Guide
 
-### 1. Build Application JARs and Docker Images
+### 1. Build Artifacts & Images
 
-First, package all microservice applications into FAT JARs using the included Maven Wrapper:
+Package the Java FAT JARs using the Maven Wrapper:
 
 ```bash
-# On Linux / macOS:
+# Unix:
 ./mvnw clean package
 
-# On Windows:
+# Windows:
 .\mvnw.cmd clean package
 ```
 
-Next, build the container images:
-
-**Build Accounts Service:**
+Build Docker container images:
 
 ```bash
-cd accounts-service
-docker build -t zkube-accounts:latest .
-```
-
-**Build Transactions Service:**
-
-```bash
-cd ../transactions-service
-docker build -t zkube-transactions:latest .
-```
-
-**Build Notifications Service:**
-
-```bash
-cd ../notifications-service
-docker build -t zkube-notifications:latest .
-```
-
-**Return to root directory:**
-
-```bash
-cd ..
+docker build -t zkube-accounts:latest ./accounts-service
+docker build -t zkube-transactions:latest ./transactions-service
+docker build -t zkube-notifications:latest ./notifications-service
 ```
 
 ---
 
-### Alternative: Run with Docker Compose
+### 2. Deploy to Kubernetes
 
-For rapid local testing outside Kubernetes, the entire stack can be launched via Docker Compose:
-
-```bash
-docker compose up -d
-```
-
-To view logs or stop the environment:
+Deploy secrets, infrastructure, and microservices in order:
 
 ```bash
-docker compose logs -f
-docker compose down
-```
+# 1. Apply Secrets (PostgreSQL credentials and connection string)
+kubectl apply -f k8s/00-secrets.yaml
 
----
-
-### 2. Deploy Infrastructure & Databases (Kubernetes)
-
-Deploy the persistence layer first. This applies the ConfigMap containing the SQL initialization scripts, spins up Redis, and boots PostgreSQL:
-
-```bash
+# 2. Deploy Infrastructure (PostgreSQL and Redis with ConfigMaps & Probes)
 kubectl apply -f k8s/01-infrastructure.yaml
-```
 
-Wait for the database and cache pods to reach the `Running` state:
-
-```bash
-kubectl get pods -w
-```
-
-### 3. Deploy the Microservices
-
-Once the database and cache pods are running (1/1 Running), deploy the Java microservices:
-
-```bash
+# 3. Deploy Microservices (Multi-replica Accounts, Transactions, Notifications)
 kubectl apply -f k8s/02-microservices.yaml
 ```
 
-### 4. Verify Cluster Health
-
-Check that all pods are running and stable:
+Verify deployment health:
 
 ```bash
-kubectl get pods
-```
-
-Check services and assigned ports:
-
-```bash
+kubectl get pods -w
 kubectl get svc
 ```
 
-> [!NOTE]
-> `accounts-service` is exposed on port 8081 and `transactions-service` on port 8082.
+---
 
-## Chaos Engineering (Resilience Testing)
+## Chaos Engineering Benchmark Results
 
-To prove system fault tolerance, Chaos Mesh is used to simulate server and pod failures during active transaction processing.
+The following benchmark data was captured across **3 consecutive benchmark runs** executing continuous Chaos Mesh pod termination (`app: transactions` terminated every 30 seconds via SIGKILL) under concurrent multi-account load.
 
-### 1. Install Helm (Windows)
+### Measured Empirical Data Across 3 Runs
 
-If Helm is not installed, install it using the Windows Package Manager:
+| Benchmark Metric | Run 1 | Run 2 | Run 3 | Combined Aggregate |
+| :--- | :--- | :--- | :--- | :--- |
+| **Duration** | 45.1 s | 46.5 s | 45.1 s | **136.7 s** |
+| **Total Requests Dispatched** | 150 | 150 | 150 | **450** |
+| **Successful Transfers (HTTP 200)** | 150 (100.0%) | 150 (100.0%) | 149 (99.3%) | **449 (99.78%)** |
+| **Server Errors (HTTP 5xx)** | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) | **0 (0.00%)** |
+| **Client Errors (HTTP 4xx)** | 0 | 0 | 0 | **0 (0.00%)** |
+| **Network Drops / Timeouts** | 0 (0.0%) | 0 (0.0%) | 1 (0.7%) | **1 (0.22%)** |
+| **Balance Conservation Invariant** | **PASSED ($0.0000)** | **PASSED ($0.0000)** | **PASSED ($0.0000)** | **PASSED (Zero fund loss)** |
+| **Notifications Dispatched / Committed** | 150 / 150 (100.0%) | 150 / 150 (100.0%) | 149 / 149 (100.0%) | **449 / 449 (100.0%)** |
+| **Event / Message Loss** | **0** | **0** | **0** | **0 (100% crash-safe)** |
+| **Pod Recovery Time (All 3 Ready)** | 0.10 s | 0.12 s | 0.10 s | **~0.11 s** |
+| **p50 Latency (Median)** | 19.10 ms | 15.45 ms | 15.84 ms | **~16.8 ms** |
+| **p95 Latency** | 2,024.72 ms | 135.67 ms | 95.36 ms | **~751.9 ms** |
+| **p99 Latency** | 3,305.32 ms | 2,464.85 ms | 2,661.22 ms | **~2,810.5 ms** |
+| **Max Latency** | 3,362.95 ms | 2,893.80 ms | 3,247.37 ms | **3,362.95 ms** |
 
-```bash
-winget install Helm.Helm
-```
+### Key Benchmark Takeaways
 
-*(Restart your terminal after installation).*
+1. **High Availability Under Pod Termination (99.78%):** By scaling the transactions service to 3 replicas with aggressive Kubernetes readiness probes (`periodSeconds: 2`, `failureThreshold: 1`), incoming requests are absorbed by the surviving replicas with zero 5xx server errors during pod termination.
+2. **Absolute Balance Invariant Conservation:** In all 450 transfer operations, the net variance across total account balances remained strictly **$0.0000**. PostgreSQL row-level locks and transaction boundaries ensure no partial debits or orphan balances occur under process crashes.
+3. **Zero Notification Loss via Redis Streams:** All 449 committed transfers were consumed and processed by the notification workers. Consumer group tracking with `XACK` guarantees that crashed workers leave pending items in the PEL, which are cleanly recovered upon reboot.
 
-### 2. Install Chaos Mesh Operator
+For the full benchmark run logs and reproduction steps, see [chaos/RESULTS.md](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/chaos/RESULTS.md).
 
-Add the Chaos Mesh repository and install the operator into an isolated namespace:
+---
 
-```bash
-helm repo add chaos-mesh https://charts.chaos-mesh.org
-helm repo update
-helm install chaos-mesh chaos-mesh/chaos-mesh -n chaos-mesh --create-namespace
-```
-
-Wait for the Chaos Mesh pods to reach the `Running` state:
-
-```bash
-kubectl get pods -n chaos-mesh -w
-```
-
-### 3. Access the Chaos Mesh Dashboard
-
-Chaos Mesh provides a web dashboard for configuring and observing experiments.
-
-**A. Open Port-Forwarding (Keep this terminal running):**
-
-```bash
-kubectl port-forward -n chaos-mesh svc/chaos-dashboard 2333:2333
-```
-
-**B. Generate Authentication Token (Open a new terminal):**
-
-Create Admin ServiceAccount:
-
-```bash
-kubectl create serviceaccount chaos-admin -n chaos-mesh
-```
-
-Grant Cluster-Admin Role:
-
-```bash
-kubectl create clusterrolebinding chaos-admin-binding --clusterrole=cluster-admin --serviceaccount=chaos-mesh:chaos-admin
-```
-
-Generate Authentication Token (48-hour expiration):
-
-```bash
-kubectl create token chaos-admin -n chaos-mesh --duration=48h
-```
-
-> [!NOTE]
-> The `cluster-admin` role binding for `chaos-admin` is intended strictly for local lab and development clusters. In production environments, adhere to the principle of least privilege by scoping RBAC permissions to specific namespaces and resources.
-
-**C. Execute the Chaos Experiment:**
-
-1. Copy the generated token.
-2. Open `http://localhost:2333` in your browser.
-3. Paste the token to authenticate.
-4. Create an experiment under **Pod Fault** -> **Pod Kill** targeting `app: transactions` with a continuous or recurring schedule.
-
-### 4. Observe Resilience with the Automated Benchmark Suite
-
-To measure system performance under chaos, run the automated benchmark runner [chaos/run-test.py](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/chaos/run-test.py):
-
-```bash
-python chaos/run-test.py --duration 60 --requests 300 --concurrency 5
-```
-
-While the chaos experiment is active:
-- The script automatically provisions test accounts, dispatches concurrent transfer requests, and measures latency.
-- Simultaneously stream logs from the notification worker to watch asynchronous processing:
-  ```bash
-  kubectl logs deployment/notifications-deployment -f
-  ```
-- As pods are terminated by Chaos Mesh, Kubernetes automatically redirects traffic to healthy pods and spins up replacements. Transactions complete successfully (`200 OK`), and the Redis queue safely preserves all notifications until a worker pod processes the backlog.
-- Detailed instructions for measuring pod recovery times and interpreting results are documented in [chaos/README.md](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/chaos/README.md).
-
-## API Documentation
+## API Reference
 
 ### 1. Create Account
+- **Endpoint:** `POST /api/accounts` (Port 8081)
+- **Request:**
+  ```json
+  {
+    "ownerName": "Alice",
+    "initialBalance": 1000.00
+  }
+  ```
+- **Response (201 Created):**
+  ```json
+  {
+    "accountId": "51f6fa70-a66c-402f-b92e-182ec76a9c57",
+    "ownerName": "Alice",
+    "balance": 1000.00,
+    "status": "CREATED"
+  }
+  ```
 
-- **Endpoint:** `POST http://localhost:8081/api/accounts`
-- **Request Body:**
+### 2. Fetch Account Balance
+- **Endpoint:** `GET /api/accounts/:id` (Port 8081)
+- **Response (200 OK):**
+  ```json
+  {
+    "id": "51f6fa70-a66c-402f-b92e-182ec76a9c57",
+    "owner_name": "Alice",
+    "balance": 1000.00
+  }
+  ```
 
-```json
-{
-  "ownerName": "Alice",
-  "balance": 1000.00
-}
-```
+### 3. Execute Atomic Transfer
+- **Endpoint:** `POST /api/transfers` (Port 8082)
+- **Headers:** `Idempotency-Key: <unique-uuid>`
+- **Request:**
+  ```json
+  {
+    "fromAccount": "51f6fa70-a66c-402f-b92e-182ec76a9c57",
+    "toAccount": "7d3a8759-11cd-4995-83de-d736deac4782",
+    "amount": 150.00
+  }
+  ```
+- **Response (200 OK):**
+  ```json
+  {
+    "status": "SUCCESS",
+    "transferId": "3bd5ac31-4607-4514-a5ee-28dc2c388118"
+  }
+  ```
 
-### 2. Execute Transfer (Atomic)
-
-- **Endpoint:** `POST http://localhost:8082/api/transfers`
-- **Request Body:**
-
-```json
-{
-  "fromAccount": "uuid-of-alice",
-  "toAccount": "uuid-of-bob",
-  "amount": 150.00
-}
-```
-
-### 3. Kubernetes Health Probes
-
-Used internally by Kubernetes `livenessProbe` and `readinessProbe` to verify pod availability.
-
-- **Endpoint:** `GET http://localhost:8082/api/transactions/health`
-- **Response:**
-
-```json
-{
-  "status": "UP",
-  "service": "transactions"
-}
-```
-
-*(Health checks are also available on port 8081 at `/api/accounts/health` and on port 8083 at `/api/notifications/health`).*
-
-## Results
-
-<!-- Run python chaos/run-test.py while a chaos experiment is active, then paste the generated benchmark Markdown table here. -->
-TODO
+### 4. Health Checks
+- `GET /api/accounts/health` (Port 8081)
+- `GET /api/transactions/health` (Port 8082)
+- `GET /api/notifications/health` (Port 8083)

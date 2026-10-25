@@ -15,17 +15,15 @@ public class TransactionsApiTest {
 
     @BeforeAll
     static void startServer() {
-        app = Javalin.create().start(0);
+        app = TransactionsApplication.createApp().start(0);
         RestAssured.port = app.port();
-
-        app.get("/api/transactions/health", ctx -> {
-            ctx.json("{\"status\": \"UP\", \"service\": \"transactions\"}");
-        });
     }
 
     @AfterAll
     static void stopServer() {
-        app.stop();
+        if (app != null) {
+            app.stop();
+        }
     }
 
     @Test
