@@ -163,22 +163,3 @@ kubectl get endpoints transactions-service -w
 
 ---
 
-## Pasting Results into the Main README
-
-When [run-test.py](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/chaos/run-test.py) finishes, it outputs a Markdown block enclosed between:
-
-```markdown
-<!-- BEGIN CHAOS BENCHMARK RESULTS (Paste into README.md ## Results) -->
-...
-<!-- END CHAOS BENCHMARK RESULTS -->
-```
-
-1. Copy the generated block from your terminal output (or from the `--output-file`).
-2. Open the root [README.md](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/README.md).
-3. Locate the `## Results` section at the bottom:
-   ```markdown
-   ## Results
-
-   TODO
-   ```
-4. Replace `TODO` with the copied Markdown block.
