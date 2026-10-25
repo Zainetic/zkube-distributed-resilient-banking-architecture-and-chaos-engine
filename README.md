@@ -216,34 +216,37 @@ kubectl get svc
 
 ## Chaos Engineering Benchmark Results
 
-The following benchmark data was captured across **3 consecutive benchmark runs** executing continuous Chaos Mesh pod termination (`app: transactions` terminated every 30 seconds via SIGKILL) under concurrent multi-account load.
+The following benchmark data was captured across **3 benchmark runs** executing scheduled Chaos Mesh pod termination (`app: transactions` terminated periodic `@every 30s` via SIGKILL) under concurrent multi-account load.
 
 ### Measured Empirical Data Across 3 Runs
 
-| Benchmark Metric | Run 1 | Run 2 | Run 3 | Combined Aggregate |
-| :--- | :--- | :--- | :--- | :--- |
-| **Duration** | 45.1 s | 46.5 s | 45.1 s | **136.7 s** |
+| Benchmark Metric | Run 1 | Run 2 | Run 3 | Combined Pooled Aggregate |
+| :--- | :---: | :---: | :---: | :---: |
+| **Duration** | 45.1 s | 45.1 s | 45.1 s | **135.3 s** |
 | **Total Requests Dispatched** | 150 | 150 | 150 | **450** |
-| **Successful Transfers (HTTP 200)** | 150 (100.0%) | 150 (100.0%) | 149 (99.3%) | **449 (99.78%)** |
+| **Successful Transfers (HTTP 200)** | 138 (92.0%) | 150 (100.0%) | 147 (98.0%) | **435 (96.67%)** |
 | **Server Errors (HTTP 5xx)** | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) | **0 (0.00%)** |
-| **Client Errors (HTTP 4xx)** | 0 | 0 | 0 | **0 (0.00%)** |
-| **Network Drops / Timeouts** | 0 (0.0%) | 0 (0.0%) | 1 (0.7%) | **1 (0.22%)** |
-| **Balance Conservation Invariant** | **PASSED ($0.0000)** | **PASSED ($0.0000)** | **PASSED ($0.0000)** | **PASSED (Zero fund loss)** |
-| **Notifications Dispatched / Committed** | 150 / 150 (100.0%) | 150 / 150 (100.0%) | 149 / 149 (100.0%) | **449 / 449 (100.0%)** |
+| **Client Errors (HTTP 4xx)** | 0 (0.0%) | 0 (0.0%) | 0 (0.0%) | **0 (0.00%)** |
+| **Network Drops / Timeouts** | 12 (8.0%) | 0 (0.0%) | 3 (2.0%) | **15 (3.33%)** |
+| **Balance Conservation Invariant** | **PASSED ($0.0000)** | **PASSED ($0.0000)** | **PASSED ($0.0000)** | **PASSED ($0.0000 net delta)** |
+| **Notifications Dispatched / Committed** | 138 / 138 (100%) | 150 / 150 (100%) | 147 / 147 (100%) | **435 / 435 (100.0%)** |
 | **Event / Message Loss** | **0** | **0** | **0** | **0 (100% crash-safe)** |
-| **Pod Recovery Time (All 3 Ready)** | 0.10 s | 0.12 s | 0.10 s | **~0.11 s** |
-| **p50 Latency (Median)** | 19.10 ms | 15.45 ms | 15.84 ms | **~16.8 ms** |
-| **p95 Latency** | 2,024.72 ms | 135.67 ms | 95.36 ms | **~751.9 ms** |
-| **p99 Latency** | 3,305.32 ms | 2,464.85 ms | 2,661.22 ms | **~2,810.5 ms** |
-| **Max Latency** | 3,362.95 ms | 2,893.80 ms | 3,247.37 ms | **3,362.95 ms** |
+| **Pod Kills Injected per Run** | **1 kill** | **2 kills** | **2 kills** | **5 total kills** (periodic @every 30s) |
+| **(i) Kill -> Endpoint Eviction** | 0.087 s | <0.001 s | 0.073 s | **Avg: 0.032 s** *(sub-100 ms)* |
+| **(ii) Kill -> Replacement Pod Ready** | 5.59 s | 5.18 s – 5.76 s | 5.54 s – 7.15 s | **Avg: 5.84 s** *(5.18 s – 7.15 s)* |
+| **(iii) Kill -> All Replicas Ready** | 5.59 s | 5.18 s – 5.76 s | 5.54 s – 7.15 s | **Avg: 5.84 s** *(5.18 s – 7.15 s)* |
+| **p50 Latency (Median)** | 43.94 ms | 28.07 ms | 34.45 ms | **33.38 ms** *(pooled 435 txs)* |
+| **p95 Latency** | 2,171.72 ms | 196.74 ms | 3,420.61 ms | **2,286.23 ms** *(pooled 435 txs)* |
+| **p99 Latency** | 3,746.83 ms | 4,274.56 ms | 4,587.03 ms | **4,350.95 ms** *(pooled 435 txs)* |
+| **Max Latency** | 4,506.29 ms | 4,721.42 ms | 4,929.62 ms | **4,929.62 ms** |
 
 ### Key Benchmark Takeaways
 
-1. **High Availability Under Pod Termination (99.78%):** By scaling the transactions service to 3 replicas with aggressive Kubernetes readiness probes (`periodSeconds: 2`, `failureThreshold: 1`), incoming requests are absorbed by the surviving replicas with zero 5xx server errors during pod termination.
-2. **Absolute Balance Invariant Conservation:** In all 450 transfer operations, the net variance across total account balances remained strictly **$0.0000**. PostgreSQL row-level locks and transaction boundaries ensure no partial debits or orphan balances occur under process crashes.
-3. **Zero Notification Loss via Redis Streams:** All 449 committed transfers were consumed and processed by the notification workers. Consumer group tracking with `XACK` guarantees that crashed workers leave pending items in the PEL, which are cleanly recovered upon reboot.
+1. **Sub-100ms Endpoint Failover:** When a transactions pod is killed, Kubernetes detects termination and evicts the dead pod IP from Service endpoints in **0.032s – 0.087s**, allowing the 2 surviving healthy replicas to absorb client load while replacement pods boot and become Ready in **5.18s – 7.15s** (average 5.84s).
+2. **Absolute Balance Invariant Conservation:** In all 450 transfer operations across 10 accounts, the net variance across total account balances remained strictly **$0.0000**. PostgreSQL row-level locks and transaction boundaries ensure no partial debits or orphan balances occur under process crashes.
+3. **Zero Notification Loss via Redis Streams:** 100% of committed transfers were consumed and processed by the notification workers. Consumer group tracking with `XACK` guarantees that crashed workers leave pending items in the PEL, which are cleanly recovered upon reboot.
 
-For the full benchmark run logs and reproduction steps, see [chaos/RESULTS.md](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/chaos/RESULTS.md).
+For the full benchmark run logs, per-request CSVs, and timeline reproduction data, see [chaos/RESULTS.md](file:///c:/Users/Neko/Documents/Zain/Java%20Projects/zkube-banking/chaos/RESULTS.md).
 
 ---
 
