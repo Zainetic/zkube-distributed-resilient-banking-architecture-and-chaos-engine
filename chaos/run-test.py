@@ -15,12 +15,16 @@ Features:
 """
 
 import argparse
-import concurrent.futures
 from collections import Counter
+import concurrent.futures
+import csv
+import datetime
+import http.client
 import json
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -59,7 +63,7 @@ def fetch_account_balance(base_url, account_id):
         return float(balance)
 
 
-def execute_transfer(base_url, from_account, to_account, amount, timeout, idempotency_key=None):
+def execute_transfer(req_index, base_url, from_account, to_account, amount, timeout, idempotency_key=None):
     if idempotency_key is None:
         idempotency_key = str(uuid.uuid4())
 
@@ -80,6 +84,8 @@ def execute_transfer(base_url, from_account, to_account, amount, timeout, idempo
         headers=headers,
         method="POST"
     )
+    start_epoch = time.time()
+    start_iso = datetime.datetime.fromtimestamp(start_epoch, datetime.timezone.utc).isoformat()
     start_time = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -91,19 +97,250 @@ def execute_transfer(base_url, from_account, to_account, amount, timeout, idempo
                 transfer_id = body.get("transferId")
             except Exception:
                 pass
-            return status_code, latency_ms, transfer_id, None, idempotency_key
+            return req_index, start_iso, start_epoch, status_code, latency_ms, transfer_id, None, idempotency_key
     except urllib.error.HTTPError as e:
         latency_ms = (time.perf_counter() - start_time) * 1000.0
-        return e.code, latency_ms, None, str(e.reason), idempotency_key
+        return req_index, start_iso, start_epoch, e.code, latency_ms, None, str(e.reason), idempotency_key
     except urllib.error.URLError as e:
         latency_ms = (time.perf_counter() - start_time) * 1000.0
-        return "CONN_ERR", latency_ms, None, str(e.reason), idempotency_key
+        return req_index, start_iso, start_epoch, "CONN_ERR", latency_ms, None, str(e.reason), idempotency_key
     except TimeoutError:
         latency_ms = (time.perf_counter() - start_time) * 1000.0
-        return "TIMEOUT", latency_ms, None, "Request timed out", idempotency_key
+        return req_index, start_iso, start_epoch, "TIMEOUT", latency_ms, None, "Request timed out", idempotency_key
     except Exception as e:
         latency_ms = (time.perf_counter() - start_time) * 1000.0
-        return "ERR_OTHER", latency_ms, None, str(e), idempotency_key
+        return req_index, start_iso, start_epoch, "ERR_OTHER", latency_ms, None, str(e), idempotency_key
+
+
+class ClusterTimelineTracker(threading.Thread):
+    """
+    High-frequency Kubernetes resilience observer.
+    Tracks pod terminations, endpoint removals, replacement pod creation,
+    and readiness state transitions with millisecond accuracy.
+    """
+    def __init__(self, proxy_host="127.0.0.1", proxy_port=8001, namespace="default", poll_interval=0.05):
+        super().__init__(daemon=True)
+        self.proxy_host = proxy_host
+        self.proxy_port = proxy_port
+        self.namespace = namespace
+        self.poll_interval = poll_interval
+        self.stop_event = threading.Event()
+        self.events = []
+        self.kills = []
+        self._conn = None
+        self._can_proxy = True
+
+    def _get_json(self, path):
+        if self._can_proxy:
+            try:
+                if self._conn is None:
+                    self._conn = http.client.HTTPConnection(self.proxy_host, self.proxy_port, timeout=3)
+                self._conn.request("GET", path)
+                resp = self._conn.getresponse()
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    return data
+                else:
+                    resp.read()
+            except Exception:
+                self._conn = None
+        return None
+
+    def query_state(self):
+        ready_ips = set()
+        ep_path = f"/apis/discovery.k8s.io/v1/namespaces/{self.namespace}/endpointslices?labelSelector=kubernetes.io/service-name=transactions-service"
+        ep_data = self._get_json(ep_path)
+        if ep_data:
+            for item in ep_data.get("items", []):
+                for ep in item.get("endpoints", []):
+                    if ep.get("conditions", {}).get("ready", False):
+                        for addr in ep.get("addresses", []):
+                            ready_ips.add(addr)
+        else:
+            try:
+                cmd = ["kubectl", "get", "endpointslices", "-n", self.namespace, "-l", "kubernetes.io/service-name=transactions-service", "-o", "json"]
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+                if res.returncode == 0:
+                    ep_data = json.loads(res.stdout)
+                    for item in ep_data.get("items", []):
+                        for ep in item.get("endpoints", []):
+                            if ep.get("conditions", {}).get("ready", False):
+                                for addr in ep.get("addresses", []):
+                                    ready_ips.add(addr)
+            except Exception:
+                pass
+
+        pods = {}
+        pod_path = f"/api/v1/namespaces/{self.namespace}/pods?labelSelector=app=transactions"
+        pod_data = self._get_json(pod_path)
+        if pod_data:
+            items = pod_data.get("items", [])
+        else:
+            try:
+                cmd = ["kubectl", "get", "pods", "-n", self.namespace, "-l", "app=transactions", "-o", "json"]
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+                items = json.loads(res.stdout).get("items", []) if res.returncode == 0 else []
+            except Exception:
+                items = []
+
+        for item in items:
+            name = item["metadata"]["name"]
+            uid = item["metadata"]["uid"]
+            ip = item.get("status", {}).get("podIP")
+            phase = item.get("status", {}).get("phase", "")
+            ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in item.get("status", {}).get("conditions", []))
+            deleting = item.get("metadata", {}).get("deletionTimestamp") is not None
+            restarts = 0
+            container_statuses = item.get("status", {}).get("containerStatuses", [])
+            if container_statuses:
+                restarts = container_statuses[0].get("restartCount", 0)
+            pods[name] = {
+                "uid": uid,
+                "ip": ip,
+                "phase": phase,
+                "ready": ready,
+                "deleting": deleting,
+                "restarts": restarts
+            }
+        return ready_ips, pods
+
+    def run(self):
+        init_ep, init_pods = self.query_state()
+        tracked_pods = dict(init_pods)
+        known_pod_names = set(init_pods.keys())
+
+        while not self.stop_event.is_set():
+            now_mono = time.perf_counter()
+            now_epoch = time.time()
+            now_iso = datetime.datetime.fromtimestamp(now_epoch, datetime.timezone.utc).isoformat()
+            ready_ips, current_pods = self.query_state()
+
+            # 1. Detect new kills among tracked pods
+            for p_name, prev_info in list(tracked_pods.items()):
+                curr_info = current_pods.get(p_name)
+                is_killed = False
+                reason = ""
+                if curr_info is None:
+                    is_killed = True
+                    reason = "pod_deleted_from_apiserver"
+                elif curr_info["deleting"] and not prev_info.get("deleting"):
+                    is_killed = True
+                    reason = "deletion_timestamp_set"
+                elif curr_info["restarts"] > prev_info.get("restarts", 0):
+                    is_killed = True
+                    reason = f"restart_count_incremented_{curr_info['restarts']}"
+
+                if is_killed:
+                    kill_record = {
+                        "kill_index": len(self.kills) + 1,
+                        "target_pod": p_name,
+                        "target_ip": prev_info.get("ip"),
+                        "target_uid": prev_info.get("uid"),
+                        "reason": reason,
+                        "t_kill_mono": now_mono,
+                        "t_kill_epoch": now_epoch,
+                        "t_kill_iso": now_iso,
+                        "ep_removed_mono": None,
+                        "ep_removed_seconds": None,
+                        "replacement_pod": None,
+                        "replacement_ready_mono": None,
+                        "replacement_ready_seconds": None,
+                        "all_ready_mono": None,
+                        "all_ready_seconds": None,
+                        "completed": False
+                    }
+                    self.kills.append(kill_record)
+                    self.events.append({
+                        "event": "POD_KILL_DETECTED",
+                        "timestamp_iso": now_iso,
+                        "pod": p_name,
+                        "ip": prev_info.get("ip"),
+                        "reason": reason
+                    })
+                    del tracked_pods[p_name]
+
+            # 2. Check active kills for endpoint removal and recovery
+            for k in self.kills:
+                if k["completed"]:
+                    continue
+
+                if k["ep_removed_mono"] is None:
+                    target_ip = k.get("target_ip")
+                    if target_ip and (target_ip not in ready_ips):
+                        k["ep_removed_mono"] = now_mono
+                        k["ep_removed_seconds"] = now_mono - k["t_kill_mono"]
+                        self.events.append({
+                            "event": "ENDPOINT_REMOVED",
+                            "timestamp_iso": now_iso,
+                            "pod": k["target_pod"],
+                            "ip": target_ip,
+                            "elapsed_s": k["ep_removed_seconds"]
+                        })
+
+                if k["replacement_pod"] is None:
+                    for cp_name, cp_info in current_pods.items():
+                        if cp_name not in known_pod_names and not cp_info["deleting"]:
+                            k["replacement_pod"] = cp_name
+                            known_pod_names.add(cp_name)
+                            tracked_pods[cp_name] = cp_info
+                            self.events.append({
+                                "event": "REPLACEMENT_POD_DETECTED",
+                                "timestamp_iso": now_iso,
+                                "pod": cp_name,
+                                "ip": cp_info.get("ip"),
+                                "elapsed_s": now_mono - k["t_kill_mono"]
+                            })
+                            break
+
+                if k["replacement_pod"] and k["replacement_ready_mono"] is None:
+                    rep_info = current_pods.get(k["replacement_pod"])
+                    if rep_info and rep_info["ready"]:
+                        k["replacement_ready_mono"] = now_mono
+                        k["replacement_ready_seconds"] = now_mono - k["t_kill_mono"]
+                        self.events.append({
+                            "event": "REPLACEMENT_POD_READY",
+                            "timestamp_iso": now_iso,
+                            "pod": k["replacement_pod"],
+                            "elapsed_s": k["replacement_ready_seconds"]
+                        })
+
+                if k["replacement_ready_mono"] is not None and k["all_ready_mono"] is None:
+                    active_ready_count = sum(1 for cp in current_pods.values() if cp["ready"] and not cp["deleting"])
+                    if active_ready_count >= 3:
+                        k["all_ready_mono"] = now_mono
+                        k["all_ready_seconds"] = now_mono - k["t_kill_mono"]
+                        k["completed"] = True
+                        self.events.append({
+                            "event": "ALL_REPLICAS_READY",
+                            "timestamp_iso": now_iso,
+                            "ready_count": active_ready_count,
+                            "elapsed_s": k["all_ready_seconds"]
+                        })
+
+            for p_name, p_info in current_pods.items():
+                if p_name in tracked_pods:
+                    tracked_pods[p_name] = p_info
+                elif p_name not in known_pod_names and not p_info["deleting"]:
+                    known_pod_names.add(p_name)
+                    tracked_pods[p_name] = p_info
+
+            time.sleep(self.poll_interval)
+
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+
+def fetch_k8s_pod_events(namespace="default"):
+    """Query cluster events for pod objects sorted by creation timestamp."""
+    try:
+        cmd = ["kubectl", "get", "events", "-n", namespace, "--field-selector", "involvedObject.kind=Pod", "--sort-by=.metadata.creationTimestamp", "-o", "json"]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        return json.loads(res.stdout).get("items", [])
+    except Exception:
+        return []
 
 
 def fetch_all_notification_logs(namespace="default"):
@@ -249,6 +486,27 @@ def main():
         default=None,
         help="Optional file path to write Markdown summary output"
     )
+    parser.add_argument(
+        "--csv-file",
+        default=None,
+        help="Optional file path to write per-request CSV output"
+    )
+    parser.add_argument(
+        "--timeline-file",
+        default=None,
+        help="Optional file path to write cluster kill/recovery timeline JSON"
+    )
+    parser.add_argument(
+        "--proxy-host",
+        default="127.0.0.1",
+        help="Kubernetes proxy host (default: 127.0.0.1)"
+    )
+    parser.add_argument(
+        "--proxy-port",
+        type=int,
+        default=8001,
+        help="Kubernetes proxy port (default: 8001)"
+    )
 
     args = parser.parse_args()
 
@@ -261,6 +519,10 @@ def main():
     print(f"Target Total Requests   : {args.requests}")
     print(f"Account Pairs           : {args.pairs} independent pairs")
     print(f"Worker Concurrency      : {args.concurrency}")
+    if args.csv_file:
+        print(f"Per-Request CSV Output  : {args.csv_file}")
+    if args.timeline_file:
+        print(f"Timeline Output File    : {args.timeline_file}")
     print("---------------------------------------------------------------------")
 
     # Step 1: Provision test account pairs
@@ -300,6 +562,18 @@ def main():
         else:
             can_check_k8s = False
 
+    # Start cluster timeline tracker if k8s monitoring is enabled
+    tracker = None
+    if can_check_k8s:
+        tracker = ClusterTimelineTracker(
+            proxy_host=args.proxy_host,
+            proxy_port=args.proxy_port,
+            namespace=args.namespace,
+            poll_interval=0.05
+        )
+        tracker.start()
+        print(" -> Cluster recovery and timeline tracker active.")
+
     # Step 3: Run load test
     if args.rate > 0:
         target_rate = args.rate
@@ -326,12 +600,12 @@ def main():
             if args.requests > 0 and total_sent >= args.requests:
                 break
 
-            # Distribute transfers evenly across the independent account pairs
             pair = account_pairs[total_sent % len(account_pairs)]
             idempotency_key = str(uuid.uuid4())
 
             fut = executor.submit(
                 execute_transfer,
+                total_sent + 1,
                 args.transactions_url,
                 pair["sender"],
                 pair["receiver"],
@@ -349,7 +623,7 @@ def main():
         for fut in concurrent.futures.as_completed(futures):
             res = fut.result()
             results.append(res)
-            status_code, latency, transfer_id, _, _ = res
+            req_idx, s_iso, s_epoch, status_code, latency, transfer_id, _, _ = res
             if status_code == 200 and transfer_id:
                 successful_transfer_ids.add(transfer_id)
 
@@ -377,8 +651,6 @@ def main():
     print("\n[5/5] Auditing Redis Stream consumer group and cluster recovery...")
     newly_processed_count = 0
     worker_check_success = False
-    recovery_seconds = 0.0
-    ready_replicas = 0
 
     if can_check_k8s:
         print(f" -> Waiting {args.drain_wait}s for Redis Streams worker group to process stream entries...")
@@ -392,8 +664,69 @@ def main():
             worker_check_success = True
             print(f" -> Matched {newly_processed_count} / {len(successful_transfer_ids)} committed transfers in notification worker logs.")
 
-        recovery_seconds, ready_replicas = measure_pod_readiness("transactions", args.namespace, timeout_s=30.0)
-        print(f" -> Kubernetes Pod Recovery: All {ready_replicas} transactions replicas 1/1 Ready in {recovery_seconds:.2f}s.")
+        if tracker is not None:
+            # Allow active kill events up to 15s to finish readiness transition
+            wait_deadline = time.perf_counter() + 15.0
+            while time.perf_counter() < wait_deadline:
+                if all(k["completed"] for k in tracker.kills):
+                    break
+                time.sleep(0.5)
+            tracker.stop_event.set()
+            tracker.join(timeout=3)
+
+    # Process recovery tracker stats
+    kills_count = len(tracker.kills) if tracker else 0
+    t_ep_removals = [k["ep_removed_seconds"] for k in tracker.kills if k["ep_removed_seconds"] is not None] if tracker else []
+    t_rep_readies = [k["replacement_ready_seconds"] for k in tracker.kills if k["replacement_ready_seconds"] is not None] if tracker else []
+    t_all_readies = [k["all_ready_seconds"] for k in tracker.kills if k["all_ready_seconds"] is not None] if tracker else []
+
+    val_ep_removal = t_ep_removals[0] if t_ep_removals else 0.0
+    val_rep_ready = t_rep_readies[0] if t_rep_readies else 0.0
+    val_all_ready = t_all_readies[0] if t_all_readies else 0.0
+
+    print(f"\n[+] Cluster Resilience Telemetry:")
+    print(f" -> Pod Kills Detected                     : {kills_count}")
+    if kills_count > 0:
+        for idx, k in enumerate(tracker.kills, 1):
+            ep_s = f"{k['ep_removed_seconds']:.3f}s" if k['ep_removed_seconds'] is not None else "N/A"
+            rep_s = f"{k['replacement_ready_seconds']:.3f}s" if k['replacement_ready_seconds'] is not None else "N/A"
+            all_s = f"{k['all_ready_seconds']:.3f}s" if k['all_ready_seconds'] is not None else "N/A"
+            print(f"    Kill #{idx} [{k['target_pod']}]:")
+            print(f"      (i)   Kill -> Endpoint Eviction        : {ep_s}")
+            print(f"      (ii)  Kill -> Replacement Pod Ready   : {rep_s}")
+            print(f"      (iii) Kill -> All Replicas Ready      : {all_s}")
+
+    # Write CSV Output
+    sorted_results = sorted(results, key=lambda x: x[0])
+    if args.csv_file:
+        try:
+            with open(args.csv_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["request_index", "timestamp_iso", "timestamp_epoch", "status", "latency_ms", "transfer_id", "idempotency_key", "error"])
+                for r in sorted_results:
+                    writer.writerow([r[0], r[1], f"{r[2]:.4f}", r[3], f"{r[4]:.2f}", r[5] or "", r[7] or "", r[6] or ""])
+            print(f"[+] Request CSV successfully written to: {args.csv_file}")
+        except Exception as e:
+            print(f"[!] Could not write CSV file {args.csv_file}: {e}")
+
+    # Write Timeline JSON Output
+    if args.timeline_file and tracker:
+        try:
+            k8s_events = fetch_k8s_pod_events(args.namespace)
+            timeline_payload = {
+                "experiment": "pod-kill",
+                "target_app": "transactions",
+                "test_duration_seconds": actual_duration,
+                "kills_count": kills_count,
+                "kills": tracker.kills,
+                "lifecycle_events": tracker.events,
+                "k8s_pod_events": k8s_events
+            }
+            with open(args.timeline_file, "w", encoding="utf-8") as f:
+                json.dump(timeline_payload, f, indent=2, default=str)
+            print(f"[+] Timeline JSON successfully written to: {args.timeline_file}")
+        except Exception as e:
+            print(f"[!] Could not write timeline file {args.timeline_file}: {e}")
 
     # Compute Statistics
     status_counts = Counter()
@@ -403,7 +736,8 @@ def main():
     success_200_count = 0
     latencies_200 = []
 
-    for status, latency, _, err, _ in results:
+    for r in results:
+        req_idx, s_iso, s_epoch, status, latency, transfer_id, err, ikey = r
         status_counts[str(status)] += 1
         if isinstance(status, int):
             if 200 <= status < 300:
@@ -452,7 +786,10 @@ def main():
         f"- **Balance Conservation Invariant Delta:** ${balance_delta:,.4f} ({'PASSED' if invariant_passed else 'FAILED'})",
         f"- **Notifications Processed vs Transfers Committed:** {notif_summary}",
         f"- **Event / Message Loss:** {message_loss}",
-        f"- **Pod Recovery Time (All {ready_replicas} Replicas Ready):** {recovery_seconds:.2f}s",
+        f"- **Pod Kills Injected:** {kills_count}",
+        f"- **(i) Kill to Service Endpoint Eviction:** {val_ep_removal:.3f}s",
+        f"- **(ii) Kill to Replacement Pod Ready:** {val_rep_ready:.2f}s",
+        f"- **(iii) Kill to All Replicas Ready:** {val_all_ready:.2f}s",
         "",
         "#### HTTP Status Code Distribution",
         "",
